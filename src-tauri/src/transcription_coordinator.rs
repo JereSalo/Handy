@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager};
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
+const MODIFIER_TAP_MAX_DURATION: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
@@ -88,6 +89,7 @@ impl TranscriptionCoordinator {
                 let mut stage = Stage::Idle;
                 let mut last_press: Option<Instant> = None;
                 let mut pending_release: Option<PendingRelease> = None;
+                let mut modifier_only_press: Option<(String, Instant)> = None;
 
                 loop {
                     let cmd = if let Some(pending) = &pending_release {
@@ -174,24 +176,48 @@ impl TranscriptionCoordinator {
                                 {
                                     stop(&app, &mut stage, &binding_id, &hotkey_string);
                                 }
-                            } else if is_pressed {
-                                match &stage {
-                                    Stage::Idle => {
-                                        start(&app, &mut stage, &binding_id, &hotkey_string);
-                                    }
-                                    Stage::Recording(id) if id == &binding_id => {
-                                        stop(&app, &mut stage, &binding_id, &hotkey_string);
-                                    }
-                                    _ => {
-                                        debug!("Ignoring press for '{binding_id}': pipeline busy")
-                                    }
+                            } else if is_modifier_only_hotkey(&hotkey_string) {
+                                if is_pressed {
+                                    modifier_only_press =
+                                        Some((binding_id.clone(), Instant::now()));
+                                    continue;
                                 }
+
+                                let Some((pressed_binding_id, pressed_at)) =
+                                    modifier_only_press.as_ref()
+                                else {
+                                    continue;
+                                };
+
+                                if pressed_binding_id != &binding_id {
+                                    debug!(
+                                        "Ignoring release for '{binding_id}' because the active modifier tap belongs to '{pressed_binding_id}'"
+                                    );
+                                    continue;
+                                }
+
+                                let pressed_at = *pressed_at;
+                                modifier_only_press = None;
+
+                                let now = Instant::now();
+                                if !is_quick_modifier_tap(pressed_at, now) {
+                                    debug!(
+                                        "Ignoring modifier-only shortcut hold for '{binding_id}' after {:?}",
+                                        now.duration_since(pressed_at)
+                                    );
+                                    continue;
+                                }
+
+                                toggle(&app, &mut stage, &binding_id, &hotkey_string);
+                            } else if is_pressed {
+                                toggle(&app, &mut stage, &binding_id, &hotkey_string);
                             }
                         }
                         Command::Cancel {
                             recording_was_active,
                         } => {
                             pending_release = None;
+                            modifier_only_press = None;
                             // Don't reset during processing — wait for the pipeline to finish.
                             if !matches!(stage, Stage::Processing)
                                 && (recording_was_active || matches!(stage, Stage::Recording(_)))
@@ -200,6 +226,7 @@ impl TranscriptionCoordinator {
                             }
                         }
                         Command::ProcessingFinished => {
+                            modifier_only_press = None;
                             stage = Stage::Idle;
                         }
                     }
@@ -254,6 +281,29 @@ impl TranscriptionCoordinator {
             warn!("Transcription coordinator channel closed");
         }
     }
+}
+
+fn toggle(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
+    match &stage {
+        Stage::Idle => {
+            start(app, stage, binding_id, hotkey_string);
+        }
+        Stage::Recording(id) if id == binding_id => {
+            stop(app, stage, binding_id, hotkey_string);
+        }
+        _ => debug!("Ignoring press for '{binding_id}': pipeline busy"),
+    }
+}
+
+fn is_modifier_only_hotkey(hotkey_string: &str) -> bool {
+    hotkey_string
+        .parse::<handy_keys::Hotkey>()
+        .map(|hotkey| hotkey.key.is_none())
+        .unwrap_or(false)
+}
+
+fn is_quick_modifier_tap(pressed_at: Instant, released_at: Instant) -> bool {
+    released_at.duration_since(pressed_at) <= MODIFIER_TAP_MAX_DURATION
 }
 
 fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
