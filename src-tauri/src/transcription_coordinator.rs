@@ -31,6 +31,7 @@ enum Command {
         hotkey_string: String,
         is_pressed: bool,
         push_to_talk: bool,
+        interrupted: bool,
     },
     Cancel {
         recording_was_active: bool,
@@ -126,6 +127,7 @@ impl TranscriptionCoordinator {
                             hotkey_string,
                             is_pressed,
                             push_to_talk,
+                            interrupted,
                         } => {
                             let pending_release_binding = pending_release
                                 .as_ref()
@@ -199,6 +201,13 @@ impl TranscriptionCoordinator {
                                 let pressed_at = *pressed_at;
                                 modifier_only_press = None;
 
+                                if interrupted {
+                                    debug!(
+                                        "Ignoring modifier-only shortcut for '{binding_id}': another key was pressed while it was held"
+                                    );
+                                    continue;
+                                }
+
                                 let now = Instant::now();
                                 if !is_quick_modifier_tap(pressed_at, now) {
                                     debug!(
@@ -243,12 +252,15 @@ impl TranscriptionCoordinator {
 
     /// Send a keyboard/signal input event for a transcribe binding.
     /// For signal-based toggles, use `is_pressed: true` and `push_to_talk: false`.
+    /// `interrupted` marks a modifier-only release that happened after another
+    /// key was pressed, i.e. a chord such as Option+N rather than a bare tap.
     pub fn send_input(
         &self,
         binding_id: &str,
         hotkey_string: &str,
         is_pressed: bool,
         push_to_talk: bool,
+        interrupted: bool,
     ) {
         if self
             .tx
@@ -257,6 +269,7 @@ impl TranscriptionCoordinator {
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
                 push_to_talk,
+                interrupted,
             })
             .is_err()
         {

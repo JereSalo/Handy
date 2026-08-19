@@ -115,11 +115,14 @@ pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<()
                     "tauri global-shortcut event: binding={}, shortcut={}, state={:?}",
                     binding_id_for_closure, shortcut_string, event.state
                 );
+                // Tauri shortcuts always include a non-modifier key, so they can
+                // never be interrupted mid-chord.
                 handle_shortcut_event(
                     app_handle,
                     &binding_id_for_closure,
                     &shortcut_string,
                     is_pressed,
+                    false,
                 );
             }
         })

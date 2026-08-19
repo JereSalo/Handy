@@ -26,18 +26,28 @@ use crate::TranscriptionCoordinator;
 /// * `binding_id` - The ID of the binding (e.g., "transcribe", "cancel")
 /// * `hotkey_string` - The string representation of the hotkey
 /// * `is_pressed` - Whether this is a key press (true) or release (false)
+/// * `interrupted` - For modifier-only hotkeys, whether another key was pressed
+///   while the modifiers were held (i.e. the modifier was used in a chord like
+///   Option+N rather than tapped on its own). Always false for other hotkeys.
 pub fn handle_shortcut_event(
     app: &AppHandle,
     binding_id: &str,
     hotkey_string: &str,
     is_pressed: bool,
+    interrupted: bool,
 ) {
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
         if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-            coordinator.send_input(binding_id, hotkey_string, is_pressed, settings.push_to_talk);
+            coordinator.send_input(
+                binding_id,
+                hotkey_string,
+                is_pressed,
+                settings.push_to_talk,
+                interrupted,
+            );
         } else {
             warn!("TranscriptionCoordinator is not initialized");
         }
