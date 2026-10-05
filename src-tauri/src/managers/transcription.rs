@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_specta::Event;
 use transcribe_cpp::{
-    Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, StreamOptions, Task,
-    WhisperRunOptions,
+    Backend, ExtSlot, Feature, Model, ModelOptions, RunExtension, RunOptions, Session,
+    StreamExtension, StreamOptions, Task, VoxtralRealtimeStreamOptions, WhisperRunOptions,
 };
 use transcribe_rs::{
     onnx::{
@@ -969,8 +969,30 @@ impl TranscriptionManager {
             let backend = session.model().backend();
 
             // StreamOptions::default() uses CommitPolicy::Auto and lets the
-            // family pick its own streaming strategy (no family-specific ext).
-            let mut stream = match session.stream(&run_options, &StreamOptions::default()) {
+            // family pick its own streaming strategy. Voxtral Realtime is the
+            // exception. The pasted text comes from the final decode after the
+            // key is released, so trading preview latency for accuracy is
+            // cheap here. A 960 ms delay (12 tokens) replaces the 480 ms
+            // default, and a 500 ms preview cadence keeps the live overlay
+            // close to the speech.
+            let stream_options = if session.model().accepts_ext(
+                ExtSlot::Stream,
+                transcribe_cpp::sys::TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM,
+            ) {
+                StreamOptions {
+                    family: Some(StreamExtension::VoxtralRealtime(
+                        VoxtralRealtimeStreamOptions {
+                            num_delay_tokens: Some(12),
+                            min_decode_interval_ms: Some(500),
+                        },
+                    )),
+                    ..Default::default()
+                }
+            } else {
+                StreamOptions::default()
+            };
+
+            let mut stream = match session.stream(&run_options, &stream_options) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to begin stream: {}", e);
