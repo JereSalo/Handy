@@ -26,8 +26,17 @@
 //! For UI key capture, a separate `KeyboardListener` is created on-demand and
 //! polled from a dedicated recording thread. Events are emitted to the frontend
 //! via Tauri's event system.
+//!
+//! ## Modifier-only shortcuts
+//!
+//! `HotkeyManager` reports a modifier-only hotkey (e.g. `option_right`) as
+//! pressed when the modifier goes down and released when it comes back up, with
+//! nothing in between. That makes a deliberate tap indistinguishable from a
+//! chord such as Option+N. The manager thread therefore keeps its own
+//! `KeyboardListener` while such a hotkey is registered and flags releases that
+//! had another key pressed during the hold.
 
-use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyboardListener};
+use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyEvent, KeyboardListener};
 use log::{debug, error, info};
 use serde::Serialize;
 use specta::Type;
@@ -54,6 +63,53 @@ enum ManagerCommand {
         response: Sender<Result<(), String>>,
     },
     Shutdown,
+}
+
+/// Watches the raw key stream to tell a bare tap of a modifier-only hotkey
+/// from the same modifier being used in a chord.
+struct ModifierTapWatch {
+    hotkey: Hotkey,
+    /// The hotkey's modifiers are currently held.
+    armed: bool,
+    /// Another key went down since the modifiers were pressed.
+    interrupted: bool,
+}
+
+impl ModifierTapWatch {
+    fn new(hotkey: Hotkey) -> Self {
+        Self {
+            hotkey,
+            armed: false,
+            interrupted: false,
+        }
+    }
+
+    fn observe(&mut self, event: &KeyEvent) {
+        let modifiers_held = self.hotkey.modifiers.matches(event.modifiers);
+
+        if event.is_key_down && event.key.is_none() && !self.armed && modifiers_held {
+            self.armed = true;
+            self.interrupted = false;
+        } else if self.armed {
+            if event.is_key_down && !self.is_own_modifier(event) {
+                self.interrupted = true;
+            }
+            // Also covers a missed release: the listener reconciles modifiers
+            // against the OS on every regular key event, so the next keystroke
+            // clears a stuck hold.
+            if !modifiers_held {
+                self.armed = false;
+            }
+        }
+    }
+
+    /// A modifier that belongs to the shortcut itself, such as the left Option
+    /// key while the binding is plain `option`, is not "another key".
+    fn is_own_modifier(&self, event: &KeyEvent) -> bool {
+        event
+            .changed_modifier
+            .is_some_and(|changed| self.hotkey.modifiers.contains(changed))
+    }
 }
 
 /// State for the handy-keys shortcut manager
@@ -123,7 +179,21 @@ impl HandyKeysState {
         let mut binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
         let mut hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
 
+        // Chord detection for modifier-only hotkeys, keyed by binding ID
+        let mut modifier_taps: HashMap<String, ModifierTapWatch> = HashMap::new();
+        let mut key_listener: Option<KeyboardListener> = None;
+
         loop {
+            // Drain raw key events first: a chord has to be recorded as an
+            // interruption before the hotkey release it produced is dispatched.
+            if let Some(listener) = &key_listener {
+                while let Some(key_event) = listener.try_recv() {
+                    for watch in modifier_taps.values_mut() {
+                        watch.observe(&key_event);
+                    }
+                }
+            }
+
             // Check for hotkey events (non-blocking)
             while let Some(event) = manager.try_recv() {
                 if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&event.id) {
@@ -132,7 +202,11 @@ impl HandyKeysState {
                         binding_id, hotkey_string, event.state
                     );
                     let is_pressed = event.state == HotkeyState::Pressed;
-                    handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed);
+                    let interrupted = !is_pressed
+                        && modifier_taps
+                            .get(binding_id)
+                            .is_some_and(|watch| watch.interrupted);
+                    handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed, interrupted);
                 }
             }
 
@@ -151,6 +225,11 @@ impl HandyKeysState {
                             &binding_id,
                             &hotkey_string,
                         );
+                        Self::sync_modifier_taps(
+                            &hotkey_to_binding,
+                            &mut modifier_taps,
+                            &mut key_listener,
+                        );
                         let _ = response.send(result);
                     }
                     ManagerCommand::Unregister {
@@ -162,6 +241,11 @@ impl HandyKeysState {
                             &mut binding_to_hotkey,
                             &mut hotkey_to_binding,
                             &binding_id,
+                        );
+                        Self::sync_modifier_taps(
+                            &hotkey_to_binding,
+                            &mut modifier_taps,
+                            &mut key_listener,
                         );
                         let _ = response.send(result);
                     }
@@ -224,6 +308,50 @@ impl HandyKeysState {
             debug!("Unregistered handy-keys shortcut: {}", binding_id);
         }
         Ok(())
+    }
+
+    /// Keep one tap watch per registered modifier-only hotkey, and a raw key
+    /// listener alive only while there is at least one of them.
+    fn sync_modifier_taps(
+        hotkey_to_binding: &HashMap<HotkeyId, (String, String)>,
+        modifier_taps: &mut HashMap<String, ModifierTapWatch>,
+        key_listener: &mut Option<KeyboardListener>,
+    ) {
+        let modifier_only: HashMap<String, Hotkey> = hotkey_to_binding
+            .values()
+            .filter_map(|(binding_id, hotkey_string)| {
+                let hotkey: Hotkey = hotkey_string.parse().ok()?;
+                hotkey.key.is_none().then(|| (binding_id.clone(), hotkey))
+            })
+            .collect();
+
+        // Drop watches for bindings that are gone or now bound to another hotkey,
+        // and keep the rest so their state survives an unrelated re-registration.
+        modifier_taps
+            .retain(|binding_id, watch| modifier_only.get(binding_id) == Some(&watch.hotkey));
+        for (binding_id, hotkey) in modifier_only {
+            modifier_taps
+                .entry(binding_id)
+                .or_insert_with(|| ModifierTapWatch::new(hotkey));
+        }
+
+        if modifier_taps.is_empty() {
+            *key_listener = None;
+        } else if key_listener.is_none() {
+            // Created after the HotkeyManager on purpose: the newest tap runs
+            // first, and the manager blocks the modifier events its hotkeys
+            // match, so a listener behind it would never see them.
+            match KeyboardListener::new() {
+                Ok(listener) => {
+                    debug!("Started key listener for modifier-only shortcuts");
+                    *key_listener = Some(listener);
+                }
+                Err(e) => error!(
+                    "Failed to start key listener for modifier-only shortcuts: {}. Chords using the modifier may trigger it.",
+                    e
+                ),
+            }
+        }
     }
 
     /// Register a shortcut binding
@@ -526,4 +654,154 @@ pub fn stop_handy_keys_recording(app: AppHandle) -> Result<(), String> {
     let result = state.stop_recording();
     super::resume_all_shortcuts(&app);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use handy_keys::{Key, Modifiers};
+
+    fn modifier_event(modifiers: Modifiers, changed: Modifiers, is_key_down: bool) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            key: None,
+            is_key_down,
+            changed_modifier: Some(changed),
+        }
+    }
+
+    fn key_event(modifiers: Modifiers, key: Key, is_key_down: bool) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            key: Some(key),
+            is_key_down,
+            changed_modifier: None,
+        }
+    }
+
+    fn right_option_down() -> KeyEvent {
+        modifier_event(Modifiers::OPT_RIGHT, Modifiers::OPT_RIGHT, true)
+    }
+
+    fn right_option_up() -> KeyEvent {
+        modifier_event(Modifiers::empty(), Modifiers::OPT_RIGHT, false)
+    }
+
+    fn watch() -> ModifierTapWatch {
+        ModifierTapWatch::new("option_right".parse().unwrap())
+    }
+
+    #[test]
+    fn bare_tap_is_not_interrupted() {
+        let mut watch = watch();
+
+        watch.observe(&right_option_down());
+        watch.observe(&right_option_up());
+
+        assert!(!watch.interrupted);
+        assert!(!watch.armed);
+    }
+
+    #[test]
+    fn chord_is_interrupted() {
+        let mut watch = watch();
+
+        watch.observe(&right_option_down());
+        watch.observe(&key_event(Modifiers::OPT_RIGHT, Key::N, true));
+        watch.observe(&key_event(Modifiers::OPT_RIGHT, Key::N, false));
+        watch.observe(&right_option_up());
+
+        assert!(watch.interrupted);
+    }
+
+    #[test]
+    fn another_modifier_interrupts() {
+        let mut watch = watch();
+
+        watch.observe(&right_option_down());
+        watch.observe(&modifier_event(
+            Modifiers::OPT_RIGHT | Modifiers::SHIFT_LEFT,
+            Modifiers::SHIFT_LEFT,
+            true,
+        ));
+        watch.observe(&modifier_event(
+            Modifiers::OPT_RIGHT,
+            Modifiers::SHIFT_LEFT,
+            false,
+        ));
+        watch.observe(&right_option_up());
+
+        assert!(watch.interrupted);
+    }
+
+    #[test]
+    fn the_next_tap_starts_clean() {
+        let mut watch = watch();
+
+        watch.observe(&right_option_down());
+        watch.observe(&key_event(Modifiers::OPT_RIGHT, Key::N, true));
+        watch.observe(&right_option_up());
+        assert!(watch.interrupted);
+
+        watch.observe(&right_option_down());
+        watch.observe(&right_option_up());
+
+        assert!(!watch.interrupted);
+    }
+
+    #[test]
+    fn keys_pressed_outside_the_hold_are_ignored() {
+        let mut watch = watch();
+
+        watch.observe(&key_event(Modifiers::empty(), Key::N, true));
+        watch.observe(&key_event(Modifiers::empty(), Key::N, false));
+        watch.observe(&right_option_down());
+        watch.observe(&right_option_up());
+
+        assert!(!watch.interrupted);
+    }
+
+    #[test]
+    fn a_missed_release_does_not_wedge_the_watch() {
+        let mut watch = watch();
+
+        watch.observe(&right_option_down());
+        // The release never arrives; the next keystroke carries the real
+        // modifier state and disarms the watch.
+        watch.observe(&key_event(Modifiers::empty(), Key::N, true));
+        assert!(!watch.armed);
+
+        watch.observe(&right_option_down());
+        watch.observe(&right_option_up());
+
+        assert!(!watch.interrupted);
+    }
+
+    #[test]
+    fn the_other_side_of_a_two_sided_binding_is_not_another_key() {
+        let mut watch = ModifierTapWatch::new("option".parse().unwrap());
+
+        watch.observe(&modifier_event(
+            Modifiers::OPT_LEFT,
+            Modifiers::OPT_LEFT,
+            true,
+        ));
+        watch.observe(&modifier_event(
+            Modifiers::OPT_LEFT | Modifiers::OPT_RIGHT,
+            Modifiers::OPT_RIGHT,
+            true,
+        ));
+        watch.observe(&modifier_event(
+            Modifiers::OPT_LEFT,
+            Modifiers::OPT_RIGHT,
+            false,
+        ));
+        watch.observe(&modifier_event(
+            Modifiers::empty(),
+            Modifiers::OPT_LEFT,
+            false,
+        ));
+
+        assert!(!watch.interrupted);
+    }
 }

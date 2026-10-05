@@ -10,6 +10,7 @@ use tauri::{AppHandle, Manager};
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
+const MODIFIER_TAP_MAX_DURATION: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
@@ -139,6 +140,9 @@ struct InputEvent {
     /// They fire on every edge by design and must never be debounced —
     /// dropping one desyncs toggle parity and wedges recording on.
     external: bool,
+    /// For modifier-only hotkeys, whether another key was pressed while the
+    /// modifier was held (a chord like Option+N rather than a bare tap).
+    interrupted: bool,
 }
 
 impl InputEvent {
@@ -222,6 +226,8 @@ struct CoordinatorState {
     last_press: Option<Instant>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
+    /// Key-down of a modifier-only toggle hotkey, waiting for its key-up.
+    modifier_press: Option<(String, Instant)>,
 }
 
 impl CoordinatorState {
@@ -232,6 +238,7 @@ impl CoordinatorState {
             last_press: None,
             pending_release: None,
             pending_press: None,
+            modifier_press: None,
         }
     }
 
@@ -247,7 +254,19 @@ impl CoordinatorState {
             || self.pending_press.as_ref().is_some_and(|p| p.locked)
     }
 
-    fn on_input(&mut self, input: InputEvent, now: Instant) -> Option<Effect> {
+    fn on_input(&mut self, mut input: InputEvent, now: Instant) -> Option<Effect> {
+        // A modifier-only toggle hotkey acts on a quick, bare tap, delivered
+        // to the machine below as a press. Holds and chords are ignored.
+        if input.mode == ShortcutActivation::Toggle
+            && !input.external
+            && is_modifier_only_hotkey(&input.hotkey_string)
+        {
+            if !self.is_modifier_tap(&input, now) {
+                return None;
+            }
+            input.is_pressed = true;
+        }
+
         let pending_release_binding = self
             .pending_release
             .as_ref()
@@ -381,6 +400,42 @@ impl CoordinatorState {
         None
     }
 
+    /// Whether this edge of a modifier-only hotkey completes a quick tap with
+    /// no other key pressed in between.
+    fn is_modifier_tap(&mut self, input: &InputEvent, now: Instant) -> bool {
+        if input.is_pressed {
+            self.modifier_press = Some((input.binding_id.clone(), now));
+            return false;
+        }
+        let Some((binding_id, pressed_at)) = &self.modifier_press else {
+            return false;
+        };
+        if binding_id != &input.binding_id {
+            debug!(
+                "Ignoring release for '{}' because the active modifier tap belongs to '{binding_id}'",
+                input.binding_id
+            );
+            return false;
+        }
+        let held = now.saturating_duration_since(*pressed_at);
+        self.modifier_press = None;
+        if input.interrupted {
+            debug!(
+                "Ignoring modifier-only shortcut for '{}': another key was pressed while it was held",
+                input.binding_id
+            );
+            return false;
+        }
+        if held > MODIFIER_TAP_MAX_DURATION {
+            debug!(
+                "Ignoring modifier-only shortcut hold for '{}' after {held:?}",
+                input.binding_id
+            );
+            return false;
+        }
+        true
+    }
+
     /// The `RELEASE_GRACE` window elapsed with no cancelling press arriving:
     /// resolve the deferred release against whatever that binding's key was
     /// holding — the live recording, or a press remembered while busy.
@@ -460,6 +515,7 @@ impl CoordinatorState {
 
     fn on_cancel(&mut self, recording_was_active: bool) {
         self.pending_release = None;
+        self.modifier_press = None;
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
         self.pending_press = None;
@@ -473,6 +529,7 @@ impl CoordinatorState {
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
+        self.modifier_press = None;
         self.stage = Stage::Idle;
         self.hold = None;
         let pending = self.pending_press.take()?;
@@ -592,7 +649,9 @@ impl TranscriptionCoordinator {
     }
 
     /// Send a keyboard input event for a transcribe binding. `hold_threshold`
-    /// only matters for [`ShortcutActivation::HoldOrToggle`].
+    /// only matters for [`ShortcutActivation::HoldOrToggle`]. `interrupted`
+    /// marks a modifier-only release that happened after another key was
+    /// pressed, i.e. a chord such as Option+N rather than a bare tap.
     pub fn send_input(
         &self,
         binding_id: &str,
@@ -600,6 +659,7 @@ impl TranscriptionCoordinator {
         is_pressed: bool,
         mode: ShortcutActivation,
         hold_threshold: Duration,
+        interrupted: bool,
     ) {
         self.send(
             binding_id,
@@ -608,6 +668,7 @@ impl TranscriptionCoordinator {
             mode,
             hold_threshold,
             false,
+            interrupted,
         );
     }
 
@@ -621,6 +682,7 @@ impl TranscriptionCoordinator {
             ShortcutActivation::Toggle,
             Duration::ZERO,
             true,
+            false,
         );
     }
 
@@ -632,6 +694,7 @@ impl TranscriptionCoordinator {
         mode: ShortcutActivation,
         hold_threshold: Duration,
         external: bool,
+        interrupted: bool,
     ) {
         if self
             .tx
@@ -642,6 +705,7 @@ impl TranscriptionCoordinator {
                 mode,
                 hold_threshold,
                 external,
+                interrupted,
             }))
             .is_err()
         {
@@ -666,6 +730,13 @@ impl TranscriptionCoordinator {
             warn!("Transcription coordinator channel closed");
         }
     }
+}
+
+fn is_modifier_only_hotkey(hotkey_string: &str) -> bool {
+    hotkey_string
+        .parse::<handy_keys::Hotkey>()
+        .map(|hotkey| hotkey.key.is_none())
+        .unwrap_or(false)
 }
 
 fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
@@ -896,6 +967,7 @@ mod tests {
             mode: ShortcutActivation::PushToTalk,
             hold_threshold: Duration::ZERO,
             external: false,
+            interrupted: false,
         }
     }
 
@@ -1034,6 +1106,7 @@ mod tests {
                     mode: ShortcutActivation::Toggle,
                     hold_threshold: Duration::ZERO,
                     external: true,
+                    interrupted: false,
                 },
                 at,
             )
@@ -1096,6 +1169,7 @@ mod tests {
             mode: ShortcutActivation::Toggle,
             hold_threshold: Duration::ZERO,
             external,
+            interrupted: false,
         }
     }
 
@@ -1221,6 +1295,7 @@ mod tests {
             mode,
             hold_threshold: HOLD_THRESHOLD,
             external: false,
+            interrupted: false,
         }
     }
 
@@ -1613,5 +1688,60 @@ mod tests {
             "held 400ms since the real key-down: must stop, not lock"
         );
         assert_eq!(state.stage, Stage::Processing);
+    }
+
+    fn modifier_input(is_pressed: bool, interrupted: bool) -> InputEvent {
+        InputEvent {
+            binding_id: BINDING.to_string(),
+            hotkey_string: "option_right".to_string(),
+            is_pressed,
+            mode: ShortcutActivation::Toggle,
+            hold_threshold: Duration::ZERO,
+            external: false,
+            interrupted,
+        }
+    }
+
+    #[test]
+    fn modifier_only_tap_toggles_on_release() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        assert_eq!(state.on_input(modifier_input(true, false), t0), None);
+        assert!(matches!(
+            state.on_input(modifier_input(false, false), t0 + ms(100)),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(
+            state.on_input(modifier_input(true, false), t0 + ms(1000)),
+            None
+        );
+        assert!(matches!(
+            state.on_input(modifier_input(false, false), t0 + ms(1100)),
+            Some(Effect::Stop { .. })
+        ));
+    }
+
+    #[test]
+    fn modifier_only_hold_is_ignored() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(modifier_input(true, false), t0);
+        assert_eq!(
+            state.on_input(modifier_input(false, false), t0 + ms(600)),
+            None
+        );
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn modifier_only_chord_is_ignored() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        state.on_input(modifier_input(true, false), t0);
+        assert_eq!(
+            state.on_input(modifier_input(false, true), t0 + ms(100)),
+            None
+        );
+        assert_eq!(state.stage, Stage::Idle);
     }
 }
